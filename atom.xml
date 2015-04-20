@@ -1,0 +1,733 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title><![CDATA[getwe`s Blog]]></title>
+  <subtitle><![CDATA[做一名全栈工程师]]></subtitle>
+  <link href="/atom.xml" rel="self"/>
+  <link href="http://getwe.cn/"/>
+  <updated>2015-04-20T06:47:48.000Z</updated>
+  <id>http://getwe.cn/</id>
+  
+  <author>
+    <name><![CDATA[getwe]]></name>
+    <email><![CDATA[honggengwei@gmail.com]]></email>
+  </author>
+  
+  <generator uri="http://hexo.io/">Hexo</generator>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-动态索引]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-varindex/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-varindex/</id>
+    <published>2014-09-17T13:20:25.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>VarIndex提供动态索引功能,支持在检索阶段动态插入新的索引并能够在短时间内被检索得到.</p>
+<a id="more"></a>
+<h2 id="一、设计思想">一、设计思想</h2><ul>
+<li>静态索引为主,动态索引为辅</li>
+<li>支持动态增加索引 </li>
+<li>不支持索引删除.(整个goose的原则上就不支持索引删除)</li>
+<li>动态索引量很小.如果有大批量的更新,那应该考虑是否改重新建库了.</li>
+<li>无论如何都需要保证高速读取是可以正常提供服务.</li>
+</ul>
+<h2 id="二、实现构成">二、实现构成</h2><p>动态索引在实现上由两个<a href="/技术/搜索引擎/goose/database-diskindex/">磁盘索引DiskIndex</a>和一个<a href="/技术/搜索引擎/goose/database-memoryindex/">内存索引MemoryIndex</a>组成.</p>
+<p>MemoryIndex的特性是支持读写,但是不可持久化存储的.<br>DiskIndex的特性是要不只读,要不只写,但是是可持久化存储的.</p>
+<p>一个磁盘库叫做<code>读取库</code>,它只能进行读取操作.<br>另外一个磁盘库叫做<code>合并库</code>,它只能进行写入操作.</p>
+<p>来个图:<br><img src="/static/img/goose-varindex-arch.png" alt="动态索引结构图"></p>
+<h2 id="三、索引读取">三、索引读取</h2><p>如架构图所示,索引读取的时候同时读取内存库以及只读库,然后进行归并.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*VarIndex) ReadIndex(t TermSign)(*InvList,error)</span><br></pre></td></tr></table></figure>
+<p>动态库提供的接口保持简洁,如无需要其它模块仍然不需要关注细节.</p>
+<h2 id="四、写入索引">四、写入索引</h2><p>再如上图,将所需要写入的索引直接往内存库写入即是.</p>
+<p>内存库是支持同时读写的,直接写进去之后马上就能被检索出来.</p>
+<h2 id="五、索引同步">五、索引同步</h2><p>动态库如上所说已经支持动态读取写入索引了,但是还存在着一下的问题:</p>
+<ul>
+<li>内存索引随着更新,越来越大怎么办?</li>
+<li>程序突然崩溃,内存索引全丢了怎么办?</li>
+</ul>
+<p>使用动态库的模块,需要定时调用动态库的合并操作接口<br><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*VarIndex) Sync() (error)</span><br></pre></td></tr></table></figure></p>
+<p>内部会进行一系列同步操作,先来个图:<br><img src="/static/img/goose-varindex-sync.png" alt="动态索引合并"></p>
+<h3 id="停止写操作">停止写操作</h3><p>待会要把内存库整个写到磁盘,这个时候不得不停止内存库再进行写入了.</p>
+<h3 id="索引库归并">索引库归并</h3><p>开始进行索引库归并,合并只读库以及内存库,然后写入合并库</p>
+<h3 id="索引读取正常">索引读取正常</h3><p>在索引库合并的过程中,依然保持索引读取正常提供服务</p>
+<h3 id="切换">切换</h3><p>完成合并后,所有索引数据都已经合并到合并库了.<br>这个时候快速做两个事情:</p>
+<ul>
+<li>切换<code>合并库</code>以及<code>读取库</code></li>
+<li>清空内存库</li>
+</ul>
+<p>完成以后,整个动态索引就变成了下图:<br><img src="/static/img/goose-varindex-swap.png" alt="动态索引合并完成"></p>
+<p>这个时候,状态回到了最初的样子,继续提供动态索引功能.</p>
+<h2 id="六、还有问题">六、还有问题</h2><p>以上设计,已经基本可以大概也许够用了.<br>但是在某下比较苛刻的情况下,还是会出问题.</p>
+<p><strong>Q</strong>:如果索引已经写到内存库,但是还是来不及sync同步到磁盘,程序崩溃重启了怎么办?<br><strong>A</strong>:保安,麻烦把这个人拖出去,谢谢!</p>
+<p>这个问题只能这样解决了:</p>
+<ol>
+<li><p>用户自己解决<br>如果崩溃了,那么短期内的索引请重发</p>
+</li>
+<li><p>增加回放功能<br>所有收到的增量更新,先备份到磁盘,等到确认的确写入到了内存索引且同步到了磁盘索引再删除备份数据.<br>程序重启的时候都先检查是否有丢失数据,如果有必须进行数据重灌.<br>为了goose稍微简单,没有实现这个逻辑,这个地方略有不足.</p>
+</li>
+</ol>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>VarIndex提供动态索引功能,支持在检索阶段动态插入新的索引并能够在短时间内被检索得到.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-静态索引]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-staticindex/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-staticindex/</id>
+    <published>2014-09-17T13:01:37.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>静态索引StaticIndex在goose中更接近业务逻辑,表示的是由其它模块生成好的只读索引.</p>
+<a id="more"></a>
+<p>StaticIndex在检索阶段中使用,提供只读索引服务.在goose中静态索引就只是由磁盘索引组成.<br>StaticIndex所设计的功能就是打开磁盘已存在的索引然后提供只读索引操作.</p>
+<p>所提供的读取方法也是直接使用DiskIndex的读取方法.<br><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 读取索引</span></span><br><span class="line"><span class="keyword">func</span> (this *StaticIndex) ReadIndex(t TermSign)(*InvList,error) &#123;</span><br><span class="line">    <span class="keyword">return</span> this.disk.ReadIndex(t)</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>静态索引StaticIndex在goose中更接近业务逻辑,表示的是由其它模块生成好的只读索引.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[买房后泡沫破灭怎么办?]]></title>
+    <link href="http://getwe.cn/%E4%B8%AA%E4%BA%BA/%E7%94%9F%E6%B4%BB/buy-an-apartment/"/>
+    <id>http://getwe.cn/个人/生活/buy-an-apartment/</id>
+    <published>2014-09-14T13:26:17.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>今年把房了,如果买完后泡沫破灭怎么办?</p>
+<a id="more"></a>
+<h1 id="是时候买房了">是时候买房了</h1><p>算是计划内,也算是迫不得已,可能有一定的难度,还需要再借点钱,买到关外地方去,但是深圳户口办下来后争取早点把房子买了.明年3月之前,现在租的房子一年到期的时候可以顺利搬过去.</p>
+<h1 id="房价跌了更买不起">房价跌了更买不起</h1><p>我认为房价比较正常的走势就是涨的慢,慢慢涨.大家收入水平涨幅增速慢慢超过房价的涨幅,相当于房子是越来越便宜了.</p>
+<p>我认为房价不太可能再次暴涨,房地产快速造富的年头已经过去了,中国的经济不可能支撑再一次暴涨了,天朝zf应该也是不允许这么个暴涨.</p>
+<p>当然,我更不认为另外一种<strong>屌丝</strong>想法:房价这么高,等跌了再入手.<br>房价要是暴跌,牵一发而动全身,实体经济肯定会受到创伤,不可能互联网行业就好过.实业都倒闭光了,没人买广告,百度赚毛线啊,其它互联网公司必定也都是不好过.到时候码农们还动不动就几十上百万年薪吗?手里的股票期权搞不好就成了废纸了.</p>
+<h1 id="买完房价跌了怎么办">买完房价跌了怎么办</h1><p>那该买还是买吧,首付凑的出来,月供能够承受还是得出手.但是万一就站在高高的山岗上出了手,然后房地产彻底崩溃了那怎么办?</p>
+<p>网上有一些说法,<strong>房子买了就买了,涨了跌了都是唯一住房,不要管他</strong>..<br>我了个天真想法,要是真暴跌,最后降薪.收入都还不了贷款了,看看还能不能做到不care.</p>
+<p>难道大家都得断供,滚回老家,房子丢给银行了吗?<br>或者能够开源节流?找一份比码农赚的还多的工作?<br>听说学挖掘机赚的多,那我就要问了:<br>学挖掘机技术哪家强?</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>今年把房了,如果买完后泡沫破灭怎么办?</p>]]>
+    
+    </summary>
+    
+      <category term="无聊" scheme="http://getwe.cn/tags/%E6%97%A0%E8%81%8A/"/>
+    
+      <category term="脑洞大开" scheme="http://getwe.cn/tags/%E8%84%91%E6%B4%9E%E5%A4%A7%E5%BC%80/"/>
+    
+      <category term="个人" scheme="http://getwe.cn/categories/%E4%B8%AA%E4%BA%BA/"/>
+    
+      <category term="生活" scheme="http://getwe.cn/categories/%E4%B8%AA%E4%BA%BA/%E7%94%9F%E6%B4%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-Data管理器]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-datamanager/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-datamanager/</id>
+    <published>2014-09-09T07:57:28.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>DataManager管理在goose内部中的全部全文数据.</p>
+<a id="more"></a>
+<h2 id="一、Data是什么">一、Data是什么</h2><p>在一个检索系统中,基本上都会有全文数据,用于存储每个Doc的全部信息,检索流程完成之后,将会返回每个Doc的全文数据,供其它系统使用.比如说前端利用这些全文数据渲染页面.<br>在我的实际工程中,也有使用到一些检索系统,不提供全文服务,在检索系统中只存储一个全局id,而在另外一个独立的分布式的key/value系统获取全文数据.设计goose的时候,直接支持了全文数据的获取,因为整个检索系统相对简单,不需要单独拉出来做一个模块.</p>
+<p>命名的时候再一次参考了<code>Xapian</code>中的<a href="http://getting-started-with-xapian.readthedocs.org/en/latest/concepts/indexing/documents.html#document-data" target="_blank" rel="external">Data</a>概念,将全文数据命名为<code>Data</code>.</p>
+<h2 id="二、设计思想">二、设计思想</h2><h3 id="变长数据">变长数据</h3><p>Data数据直接的特点就是变长,输入系统的每一个Doc肯定长度不一,存储的时候需要支持变长数据.</p>
+<h3 id="通用透明">通用透明</h3><p>跟Value数据一样,为了保持通用性,goose中的Data就是一段二进制流<code>[]byte</code>,由策略决定如何使用.</p>
+<h3 id="追加写">追加写</h3><p>goose中对Data数据的写操作只支持在末尾追加写.<br>在建库以及增量更新阶段,goose将顺序写入Data数据.对于Data数据,只需要能够一直追加写入数据即可.由于Data是变长的,为了实现起来比较方便,不支持对Data文件进行修改和删除操作.如果对Data数据实在有修改需求,解决方法是再插入一个新的Doc,并在策略中根据外部ID做去重,这样做虽然造成了磁盘空间的浪费,但是机制比较简单.</p>
+<h3 id="随机读">随机读</h3><p>写操作限制比较多,读操作没有多少限制.功能上的需求要求能够随机读取数据,需要支持安全并发读取.</p>
+<h2 id="二、实现方法">二、实现方法</h2><p>在实现上采用了跟<a href="/技术/搜索引擎/goose/database-diskindex/">磁盘索引DiskIndex</a>非常类似的设计.如图采用了两层索引.</p>
+<p><img src="/static/img/goose-datamanager.png" alt="Data磁盘数据结构"></p>
+<h3 id="二级索引">二级索引</h3><p>把每个写入的Doc的Data数据顺序写到磁盘文件,索引信息就是<code>FileNo,Offset,Length</code>.</p>
+<h3 id="一级索引">一级索引</h3><p>一级索引使用mmap实现,整个一级索引就是一个大数组,数组下标就是内部id,数组元素就是<code>FileNo,Offset,Length</code>.</p>
+<h2 id="三、写入Data数据">三、写入Data数据</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DataManager) Append(inId InIdType,d Data) (error)</span><br></pre></td></tr></table></figure>
+<p>追加数据文件.不可并发写入,使用者应该自己做好并发控制.<br>同一个InId多次写入会进行覆盖操作,只有最后一次写操作数据有效,而且之前的写入的<br>数据会变成垃圾数据占用磁盘空间,无法删除.</p>
+<p>把整块数据不经过任何处理,追加写入磁盘文件,再把磁盘索引信息写入一级索引.</p>
+<h2 id="四、读取Data数据">四、读取Data数据</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DataManager) ReadData(inId InIdType,buf *Data) (error)</span><br></pre></td></tr></table></figure>
+<p>读取Data在检索阶段是一个高频动作,因此实现的读取是支持并发安全读取,内部不加锁.<br>在BigFile中,读取文件使用的是<code>os.File.ReadAt</code>方法,其底层是使用了<code>pread</code>读取,这个函数是并发安全的.</p>
+<p>读取的时候需要外部传入一块空间足够的buf存放读取的结果.</p>
+<h2 id="五、作业">五、作业</h2><p>给自己留一个作业,后续抽时间研究一下其它数据结构,支持磁盘数据的增删查改,在效率上有一定的折衷取舍.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>DataManager管理在goose内部中的全部全文数据.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-Value管理器]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-valuemanager/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-valuemanager/</id>
+    <published>2014-08-29T14:03:58.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>ValueManager在goose中负责管理<code>Value</code>数据.</p>
+<a id="more"></a>
+<h2 id="一、Value是什么">一、Value是什么</h2><p>在goose的整个检索阶段,除了计算文本相关性,还可以利用额外的非文本信息对结果进行调权,影响排序.<br>这些跟doc相关的数据,就是Value.实际上就是一小段数据,在建库的时候随着doc一起建库,在检索中根据doc的唯一内部id获取.</p>
+<p>如果了解过其它搜索引擎,总能找到类似的概念,比如<a href="http://xapian.org/" target="_blank" rel="external">xapian</a>中的<a href="http://getting-started-with-xapian.readthedocs.org/en/latest/concepts/indexing/values.html" target="_blank" rel="external">Values</a></p>
+<h3 id="实际例子">实际例子</h3><p>在一个检索系统,除了文本相关信息之外,希望把用户经常点击的结果往前排,那么可以将点击率写入Value,在检索的时候从Value解析得到点击率,进而对检索结果得分进行调权.</p>
+<h2 id="二、设计思想">二、设计思想</h2><p>设计goose的Value机制的时候,我做了这样一些取舍:</p>
+<h3 id="定长">定长</h3><p>在goose中,每个doc所关联的Value是定长的,具体长度在建库的时候根据外部配置文件决定.<br>定长Value在实现上比较方便,对我就是这样追求简约(我就是这么懒)<br>变长的Value可以根据每个doc的需要存储不同长度的数据,可以做到空间不浪费,但是随而带来的是系统的复杂度急剧提升,容易出错.在我实际的工程经验上,也很少有这方面的需求,定长Value在大多数情况下是足够的.</p>
+<p>另外,Value的大小是由配置指定,意味着在整个索引库使用过程中不能随便改变其大小.建库的时候使用多大的Value,检索的时候也必须保持一致,不然程序可能崩溃.</p>
+<h3 id="通用透明">通用透明</h3><p>为了保持一定的通用性,goose本身作为一个框架,完全不管Value里面写入的是什么数据,甚至于连具体什么格式都不管.<br>Value其实就是<code>[]byte</code>,一段二进制数据,建库的时候策略定制写入,检索阶段从其中解析数据.框架只负责管理读写.</p>
+<h2 id="三、实现方法">三、实现方法</h2><p>Value的需求是需要在检索阶段能够快速读取,因此直接使用磁盘存储不太现实,完全放在内存中又可能会导致程序内存过大.因此在goose中简单采用mmap进行管理,兼顾一定的读写性能.</p>
+<p>另外考虑到mmap文件可能太大,实际存储的时候会分成多个mmap文件,读写的时候根据id分到不同的文件去读写.</p>
+<h2 id="四、读取Value">四、读取Value</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 读取value的引用,value只能进行读操作,任何写操作都是非法的</span></span><br><span class="line"><span class="keyword">func</span> (*ValueManager) ReadValue(inId InIdType)(Value,error)</span><br></pre></td></tr></table></figure>
+<p>读取接口根据内部id返回对应的Value.<br>由于go中没有类似c的<code>const char *</code>类型,目前这个接口有一个小缺陷,需要调用者自身保证不对Value进行写入操作.</p>
+<h2 id="五、写入Value">五、写入Value</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 写入Value.可并发写</span></span><br><span class="line"><span class="keyword">func</span> (*ValueManager) WriteValue(inId InIdType,v Value)(error)</span><br></pre></td></tr></table></figure>
+<p>写入操作也比较简单,根据id确定写入文件以及文件偏移量然后写入Value.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>ValueManager在goose中负责管理<code>Value</code>数据.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[第N小的数]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E9%9D%A2%E8%AF%95%E7%AE%97%E6%B3%95/algorithm/the-min-n/"/>
+    <id>http://getwe.cn/技术/面试算法/algorithm/the-min-n/</id>
+    <published>2014-08-28T14:02:14.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>一个常见于面试中题目,<strong>查找第N小的元素</strong>.</p>
+<a id="more"></a>
+<p>印象在实际工作中还没使用过,就是在这些年的招聘中问过好几次这个问题,所以在这里分类给分到面试算法中.</p>
+<h1 id="越简单越好">越简单越好</h1><p>简单才好,效率不是最高和可以接受.如果数组真的不大,干嘛不进行一次全排序,然后输出结果呢?</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">std</span>::sort(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line"><span class="built_in">std</span>::<span class="built_in">cout</span>&lt;&lt;<span class="built_in">array</span>[num]&lt;&lt;<span class="built_in">std</span>::endl;</span><br></pre></td></tr></table></figure>
+<p>代码简单,用任何一种语言都会有对应的基础库,直接做个排序输出,这就是最佳答案!</p>
+<h1 id="分治解决">分治解决</h1><p>如果说需要处理的数组非常大,以至于全排序需要浪费很多计算资源,做了很多没必要的排序.<br>那么改进的思路就是利用快排类似的做法,快速定位.<br>首先,需要一个跟快排完全一样的分区算法:<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 跟快速排序所用到的partiton方法完全一样</span></span><br><span class="line"><span class="comment">// [low,high]</span></span><br><span class="line"><span class="comment">// 从小到大排序</span></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">partition</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> low,<span class="keyword">unsigned</span> <span class="keyword">int</span> high)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="comment">// 取中间一个数作为支点,避免出现最坏情况</span></span><br><span class="line">    <span class="built_in">std</span>::swap(<span class="built_in">array</span>[low],<span class="built_in">array</span>[(low+high)/<span class="number">2</span>]);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">unsigned</span> <span class="keyword">int</span> pivotkey = <span class="built_in">array</span>[low];</span><br><span class="line">    <span class="comment">// 要点:分区算法的退出在于low == high 三个循环都需要</span></span><br><span class="line">    <span class="keyword">while</span> (low &lt; high)&#123;</span><br><span class="line">        <span class="comment">// 找到比支点还小,换到前面半区</span></span><br><span class="line">        <span class="keyword">while</span>(low &lt; high &amp;&amp; pivotkey &lt;= <span class="built_in">array</span>[high])</span><br><span class="line">            --high;</span><br><span class="line">        <span class="built_in">array</span>[low] = <span class="built_in">array</span>[high];</span><br><span class="line">        <span class="comment">// 找到比支点还大,换到后面半区</span></span><br><span class="line">        <span class="keyword">while</span>(low &lt; high &amp;&amp; <span class="built_in">array</span>[low] &lt; pivotkey)</span><br><span class="line">            ++low;</span><br><span class="line">        <span class="built_in">array</span>[high] = <span class="built_in">array</span>[low];</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// low == high</span></span><br><span class="line">    <span class="built_in">array</span>[low] = pivotkey;</span><br><span class="line">    <span class="keyword">return</span> low;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p>
+<p>这样分区后,可以把数组分成两块,然后再看需要在的数字是在左半部分还是右半部分,然后再处理对应的部分,另外一部分就可以完全忽略了.<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 快速局部排序,找到第N小的数,其它元素不一定有序</span></span><br><span class="line"><span class="comment">// N取值范围是[0,arrayLen)</span></span><br><span class="line"><span class="function"><span class="keyword">bool</span> <span class="title">findMinN</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen,<span class="keyword">int</span> num)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (num &lt; <span class="number">0</span> || num &gt;= arrayLen)&#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">int</span> mid = -<span class="number">1</span>;</span><br><span class="line">    <span class="keyword">int</span> left = <span class="number">0</span>;</span><br><span class="line">    <span class="keyword">int</span> right = arrayLen-<span class="number">1</span>;</span><br><span class="line">    <span class="keyword">while</span> (mid != num)&#123;</span><br><span class="line">        mid = partition(<span class="built_in">array</span>,left,right);</span><br><span class="line">        <span class="keyword">if</span> (num &lt; mid)</span><br><span class="line">            right = mid - <span class="number">1</span>;</span><br><span class="line">        <span class="keyword">if</span> (num &gt; mid)</span><br><span class="line">            left = mid + <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> <span class="keyword">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p>
+<h1 id="堆排序">堆排序</h1><p>以上的解法都要求全部数据都需要导到内存进行处理,如果数组特别大,那么就不可取了.<br>M个数求第N小的数.如果N个数内存完全放得下,那么可以建一个最大堆来处理.<br>依次读入M个数,保持维护一个最大堆,全部处理完成后,堆剩下的就是最小的N个数,而堆顶就是第N小个数.<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 使用堆辅助实现</span></span><br><span class="line"><span class="comment">// 快排实现需要把全部数据在内存中进行排序,只是不需要做全排而已</span></span><br><span class="line"><span class="comment">// 如果全部数据在内存放不下,而N个数在内存中放得下,应该使用堆实现</span></span><br><span class="line"><span class="comment">// 演示方便,还是使用纯内存数组</span></span><br><span class="line"><span class="comment">// N取值范围是[0,arrayLen)</span></span><br><span class="line"><span class="function"><span class="keyword">bool</span> <span class="title">findMinNHeap</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen,<span class="keyword">int</span> num)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">if</span> (num &lt; <span class="number">0</span> || num &gt;= arrayLen)&#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">// 先把前num+1个元素建成大顶堆</span></span><br><span class="line">    make_heap(<span class="built_in">array</span>,<span class="built_in">array</span>+num+<span class="number">1</span>);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i=num+<span class="number">1</span>;i&lt;arrayLen;i++)&#123;</span><br><span class="line">        <span class="keyword">if</span> (<span class="built_in">array</span>[i] &gt; <span class="built_in">array</span>[<span class="number">0</span>])&#123;</span><br><span class="line">            <span class="keyword">continue</span>;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        pop_heap(<span class="built_in">array</span>,<span class="built_in">array</span>+num+<span class="number">1</span>);</span><br><span class="line">        <span class="built_in">array</span>[num] = <span class="built_in">array</span>[i];</span><br><span class="line">        push_heap(<span class="built_in">array</span>,<span class="built_in">array</span>+num+<span class="number">1</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 堆里面保留了最小的n个元素</span></span><br><span class="line">    <span class="comment">// 堆顶就是第n小个数</span></span><br><span class="line">    swap(<span class="built_in">array</span>[<span class="number">0</span>],<span class="built_in">array</span>[num]);</span><br><span class="line">    <span class="keyword">return</span> <span class="keyword">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p>
+<h1 id="标准库算法">标准库算法</h1><p>如果是使用c++编程,标准库里面就有一个算法可以直接使用,如果是真正工程上的问题,理解解决问题的思路,然后用现成的吧<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">nth_element(<span class="built_in">array</span>,<span class="built_in">array</span>+num,<span class="built_in">array</span>+arrayLen);</span><br><span class="line"><span class="built_in">cout</span>&lt;&lt;array3[num]&lt;&lt;endl;</span><br></pre></td></tr></table></figure></p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>一个常见于面试中题目,<strong>查找第N小的元素</strong>.</p>]]>
+    
+    </summary>
+    
+      <category term="分治法" scheme="http://getwe.cn/tags/%E5%88%86%E6%B2%BB%E6%B3%95/"/>
+    
+      <category term="快速排序" scheme="http://getwe.cn/tags/%E5%BF%AB%E9%80%9F%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="算法" scheme="http://getwe.cn/tags/%E7%AE%97%E6%B3%95/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="面试算法" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E9%9D%A2%E8%AF%95%E7%AE%97%E6%B3%95/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[快速排序]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/algorithm/quickSort/"/>
+    <id>http://getwe.cn/技术/基础算法/algorithm/quickSort/</id>
+    <published>2014-08-26T07:05:29.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>快速排序的递归实现和利用栈数据结构实现.</p>
+<a id="more"></a>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br></pre></td><td class="code"><pre><span class="line"><span class="preprocessor">#<span class="keyword">include</span> "interface.h"</span></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="comment">// [low,high]</span></span><br><span class="line"><span class="comment">// 从小到大排序</span></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">partition</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> low,<span class="keyword">unsigned</span> <span class="keyword">int</span> high)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="comment">// 取中间一个数作为支点,避免出现最坏情况</span></span><br><span class="line">    <span class="built_in">std</span>::swap(<span class="built_in">array</span>[low],<span class="built_in">array</span>[(low+high)/<span class="number">2</span>]);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">unsigned</span> <span class="keyword">int</span> pivotkey = <span class="built_in">array</span>[low];</span><br><span class="line">    <span class="comment">// 要点:分区算法的退出在于low == high 三个循环都需要</span></span><br><span class="line">    <span class="keyword">while</span> (low &lt; high)&#123;</span><br><span class="line">        <span class="comment">// 找到比支点还小,换到前面半区</span></span><br><span class="line">        <span class="keyword">while</span>(low &lt; high &amp;&amp; pivotkey &lt;= <span class="built_in">array</span>[high])</span><br><span class="line">            --high;</span><br><span class="line">        <span class="built_in">array</span>[low] = <span class="built_in">array</span>[high];</span><br><span class="line">        <span class="comment">// 找到比支点还大,换到后面半区</span></span><br><span class="line">        <span class="keyword">while</span>(low &lt; high &amp;&amp; <span class="built_in">array</span>[low] &lt; pivotkey)</span><br><span class="line">            ++low;</span><br><span class="line">        <span class="built_in">array</span>[high] = <span class="built_in">array</span>[low];</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// low == high</span></span><br><span class="line">    <span class="built_in">array</span>[low] = pivotkey;</span><br><span class="line">    <span class="keyword">return</span> low;</span><br><span class="line">&#125;</span><br><span class="line"><span class="comment">// [0,arrLen)</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">quickSort</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (arrayLen &gt; <span class="number">1</span>)&#123;</span><br><span class="line">        <span class="keyword">unsigned</span> <span class="keyword">int</span> mid = partition(<span class="built_in">array</span>,<span class="number">0</span>,arrayLen-<span class="number">1</span>);</span><br><span class="line">        quickSort(<span class="built_in">array</span>,mid);</span><br><span class="line">        quickSort(<span class="built_in">array</span>+mid+<span class="number">1</span>,arrayLen-mid-<span class="number">1</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// [0,arrlen)</span></span><br><span class="line"><span class="comment">// 利用栈实现</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">quickSort_stack</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="comment">// [first,second]</span></span><br><span class="line">    <span class="keyword">typedef</span> pair&lt;<span class="keyword">unsigned</span> <span class="keyword">int</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span>&gt; LR; </span><br><span class="line">    <span class="built_in">stack</span>&lt;LR&gt; SortStack;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">    SortStack.push(make_pair(<span class="number">0</span>,arrayLen-<span class="number">1</span>));</span><br><span class="line">    <span class="keyword">while</span> (!SortStack.empty())&#123;</span><br><span class="line">        LR lr = SortStack.top();</span><br><span class="line">        SortStack.pop();</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (lr.second &gt; lr.first)&#123;</span><br><span class="line">            <span class="keyword">unsigned</span> <span class="keyword">int</span> mid = partition(<span class="built_in">array</span>,lr.first,lr.second);</span><br><span class="line">            SortStack.push(make_pair(lr.first,mid));</span><br><span class="line">            SortStack.push(make_pair(mid+<span class="number">1</span>,lr.second));</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">main</span><span class="params">()</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">const</span> <span class="keyword">int</span> arrayLen = <span class="number">20</span>;</span><br><span class="line">    <span class="keyword">int</span> <span class="built_in">array</span>[arrayLen];</span><br><span class="line">    <span class="keyword">int</span> arr1[arrayLen];</span><br><span class="line">    <span class="keyword">int</span> arr2[arrayLen];</span><br><span class="line">    <span class="keyword">int</span> arr3[arrayLen];</span><br><span class="line"></span><br><span class="line">    myRand(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"                    : "</span>;</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">for</span>(<span class="keyword">int</span> i=<span class="number">0</span>;i&lt;arrayLen;i++)&#123;</span><br><span class="line">        arr1[i] = arr2[i] = arr3[i] = <span class="built_in">array</span>[i];</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"std::sort           : "</span>;</span><br><span class="line">    sort(arr1,arr1+arrayLen);</span><br><span class="line">    array_dump(arr1,arr1+arrayLen);</span><br><span class="line"></span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"quick sort (resurse): "</span>;</span><br><span class="line">    quickSort(arr2,arrayLen);</span><br><span class="line">    array_dump(arr2,arr2+arrayLen);</span><br><span class="line"></span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"quick sort (stack)  : "</span>;</span><br><span class="line">    quickSort_stack(arr3,arrayLen);</span><br><span class="line">    array_dump(arr3,arr3+arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;endl;</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>快速排序的递归实现和利用栈数据结构实现.</p>]]>
+    
+    </summary>
+    
+      <category term="分治法" scheme="http://getwe.cn/tags/%E5%88%86%E6%B2%BB%E6%B3%95/"/>
+    
+      <category term="快速排序" scheme="http://getwe.cn/tags/%E5%BF%AB%E9%80%9F%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="排序" scheme="http://getwe.cn/tags/%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="算法" scheme="http://getwe.cn/tags/%E7%AE%97%E6%B3%95/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="基础算法" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[经典排序]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/algorithm/classic-sort/"/>
+    <id>http://getwe.cn/技术/基础算法/algorithm/classic-sort/</id>
+    <published>2014-08-26T02:09:23.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>经典的几个排序算法:冒泡,选择,插入.</p>
+<a id="more"></a>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br></pre></td><td class="code"><pre><span class="line"><span class="preprocessor">#<span class="keyword">include</span> "interface.h"</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 冒泡排序,时间复杂度在n(n-1)/2 -- O(n^2)之间</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">bubbleSort</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> len)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="comment">// end表示end之后的元素都是有序的</span></span><br><span class="line">    <span class="keyword">unsigned</span> <span class="keyword">int</span> end = len - <span class="number">1</span>;</span><br><span class="line">    <span class="keyword">while</span> (end &gt; <span class="number">0</span>)&#123;</span><br><span class="line">        <span class="comment">// 最后一次置换的元素,last之后的元素也是有序的</span></span><br><span class="line">        <span class="keyword">int</span> last = <span class="number">0</span>;</span><br><span class="line">        <span class="comment">// 每次循环从数组起始位置开始</span></span><br><span class="line">        <span class="keyword">for</span>(<span class="keyword">int</span> i=<span class="number">0</span>;i&lt;end;++i)&#123;</span><br><span class="line">            <span class="keyword">if</span> (<span class="built_in">array</span>[i] &gt; <span class="built_in">array</span>[i+<span class="number">1</span>])&#123;</span><br><span class="line">                <span class="built_in">std</span>::swap(<span class="built_in">array</span>[i],<span class="built_in">array</span>[i+<span class="number">1</span>]);</span><br><span class="line">                last = i;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        end = last;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="comment">// 选择排序,认为是O(n^2),实现简单,待排序数组够小用选择挺好</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">selectSort</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> len)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i=<span class="number">0</span>;i&lt;len-<span class="number">1</span>;i++)&#123;</span><br><span class="line">        <span class="keyword">int</span> min=i;</span><br><span class="line">        <span class="keyword">for</span> (<span class="keyword">int</span> j=i+<span class="number">1</span>;j&lt;len;j++)&#123;</span><br><span class="line">            <span class="keyword">if</span> (<span class="built_in">array</span>[j]&lt;<span class="built_in">array</span>[min])&#123;</span><br><span class="line">                min=j;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="built_in">std</span>::swap(<span class="built_in">array</span>[i],<span class="built_in">array</span>[min]);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 插入排序,实际用途有吗?</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">insertSort</span><span class="params">(<span class="keyword">int</span> * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> len)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="comment">// 将最小元素放在最前面做观察哨</span></span><br><span class="line">    <span class="keyword">int</span> min=<span class="number">0</span>;</span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i=<span class="number">0</span>;i&lt;len;i++)&#123;</span><br><span class="line">        <span class="keyword">if</span> (<span class="built_in">array</span>[i]&lt;<span class="built_in">array</span>[min])&#123;</span><br><span class="line">            min=i;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="built_in">std</span>::swap(<span class="built_in">array</span>[<span class="number">0</span>],<span class="built_in">array</span>[min]);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// i之前的元素都是符合目标的有序数组了</span></span><br><span class="line">    <span class="comment">// 紧接着把i后面剩下的每一个元素进行插入操作</span></span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i=<span class="number">1</span>;i&lt;len;i++)&#123;</span><br><span class="line">        <span class="comment">// j从待插入元素开始出发</span></span><br><span class="line">        <span class="keyword">int</span> j=i;</span><br><span class="line">        <span class="comment">// 暂存待插入元素</span></span><br><span class="line">        <span class="keyword">int</span> toInsert = <span class="built_in">array</span>[j];</span><br><span class="line">        <span class="comment">// 前面的元素比当前位置的还大,就进行后遗一步操作</span></span><br><span class="line">        <span class="keyword">while</span> (<span class="built_in">array</span>[j-<span class="number">1</span>] &gt; toInsert )&#123;</span><br><span class="line">            <span class="built_in">array</span>[j] = <span class="built_in">array</span>[j-<span class="number">1</span>];</span><br><span class="line">            j--;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 否则,当前就是插入位置</span></span><br><span class="line">        <span class="built_in">array</span>[j] = toInsert;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">main</span><span class="params">()</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">const</span> <span class="keyword">int</span> arrayLen = <span class="number">20</span>;</span><br><span class="line">    <span class="keyword">int</span> <span class="built_in">array</span>[arrayLen];</span><br><span class="line">    myRand(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"                "</span>;</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    insertSort(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"insert   Sort : "</span>;</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    selectSort(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"select   Sort : "</span>;</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    bubbleSort(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;<span class="string">"bubble   sort : "</span>;</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;endl;</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>经典的几个排序算法:冒泡,选择,插入.</p>]]>
+    
+    </summary>
+    
+      <category term="冒泡排序" scheme="http://getwe.cn/tags/%E5%86%92%E6%B3%A1%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="排序" scheme="http://getwe.cn/tags/%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="插入排序" scheme="http://getwe.cn/tags/%E6%8F%92%E5%85%A5%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="算法" scheme="http://getwe.cn/tags/%E7%AE%97%E6%B3%95/"/>
+    
+      <category term="选择排序" scheme="http://getwe.cn/tags/%E9%80%89%E6%8B%A9%E6%8E%92%E5%BA%8F/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="基础算法" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[二分查找]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/algorithm/binarySearch/"/>
+    <id>http://getwe.cn/技术/基础算法/algorithm/binarySearch/</id>
+    <published>2014-08-26T01:51:59.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>最简单的二分查找以及变形.</p>
+<a id="more"></a>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br></pre></td><td class="code"><pre><span class="line"></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span> "interface.h"</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 输入要求,数组前后闭空间[low,high],升序有序</span></span><br><span class="line"><span class="comment">// 二分搜索查找</span></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">binarySearch</span><span class="params">(<span class="keyword">int</span> <span class="built_in">array</span>[],<span class="keyword">int</span> v,<span class="keyword">int</span> low,<span class="keyword">int</span> high)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">while</span> (low &lt;= high)&#123;</span><br><span class="line">        <span class="keyword">int</span> mid = (low + high) / <span class="number">2</span>;</span><br><span class="line">        <span class="keyword">if</span> (v == <span class="built_in">array</span>[mid])&#123;</span><br><span class="line">            <span class="keyword">return</span> mid;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">if</span> (v &gt; <span class="built_in">array</span>[mid])&#123;</span><br><span class="line">            low = mid + <span class="number">1</span>;</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            high = mid - <span class="number">1</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> -<span class="number">1</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 输入要求,数组前后闭空间[low,high],升序有序</span></span><br><span class="line"><span class="comment">// 二分搜索查找,如果成功查找,返回坐标.如果没有查找到,返回比目标小,差距最小的元素</span></span><br><span class="line"><span class="comment">// 二分搜索的简单变形,有一些场景需要这样的要求</span></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">binarySearchClosest</span><span class="params">(<span class="keyword">int</span> <span class="built_in">array</span>[],<span class="keyword">int</span> v,<span class="keyword">int</span> low,<span class="keyword">int</span> high)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">int</span> len = high;</span><br><span class="line">    <span class="keyword">while</span> (low &lt;= high)&#123;</span><br><span class="line">        <span class="keyword">int</span> mid = (low + high) / <span class="number">2</span>;</span><br><span class="line">        <span class="keyword">if</span> (v == <span class="built_in">array</span>[mid])&#123;</span><br><span class="line">            <span class="keyword">return</span> mid;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">if</span> (v &gt; <span class="built_in">array</span>[mid])&#123;</span><br><span class="line">            low = mid + <span class="number">1</span>;</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            high = mid - <span class="number">1</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// while 最后一次开始的时候,low == high == mid</span></span><br><span class="line">    <span class="comment">// 如果v &gt; array[mid] low = mid + 1</span></span><br><span class="line">    <span class="comment">// 变成 high == mid &lt; low</span></span><br><span class="line">    <span class="comment">// 如果v &lt; array[mid] high = mid - 1</span></span><br><span class="line">    <span class="comment">// 变成 high &lt; mid == low</span></span><br><span class="line">    <span class="comment">// 结果都是array[high]是小于v且差距最小的一个</span></span><br><span class="line">    assert(low == high + <span class="number">1</span>);</span><br><span class="line">    <span class="keyword">int</span> closest = high;</span><br><span class="line">    <span class="keyword">return</span> closest;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">main</span><span class="params">()</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">const</span> <span class="keyword">int</span> arrayLen = <span class="number">20</span>;</span><br><span class="line">    <span class="keyword">int</span> <span class="built_in">array</span>[arrayLen];</span><br><span class="line">    myRand(<span class="built_in">array</span>,arrayLen);</span><br><span class="line">    <span class="built_in">std</span>::sort(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    array_dump(<span class="built_in">array</span>,<span class="built_in">array</span>+arrayLen);</span><br><span class="line">    <span class="keyword">int</span> value = <span class="number">0</span>;</span><br><span class="line">    <span class="keyword">do</span> &#123;</span><br><span class="line">        <span class="built_in">cout</span>&lt;&lt;<span class="string">"num to search : "</span>;</span><br><span class="line">        <span class="keyword">if</span> (!(<span class="built_in">cin</span>&gt;&gt;value))&#123;</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">int</span> pos = binarySearch(<span class="built_in">array</span>,value,<span class="number">0</span>,<span class="keyword">sizeof</span>(<span class="built_in">array</span>)/<span class="keyword">sizeof</span>(<span class="keyword">int</span>) - <span class="number">1</span>);</span><br><span class="line">        <span class="built_in">cout</span>&lt;&lt;<span class="string">"found pos : "</span>&lt;&lt;pos&lt;&lt;endl;</span><br><span class="line"></span><br><span class="line">        pos = binarySearchClosest(<span class="built_in">array</span>,value,<span class="number">0</span>,<span class="keyword">sizeof</span>(<span class="built_in">array</span>)/<span class="keyword">sizeof</span>(<span class="keyword">int</span>) - <span class="number">1</span>);</span><br><span class="line">        <span class="built_in">cout</span>&lt;&lt;<span class="string">"closest pos : "</span>&lt;&lt;pos&lt;&lt;<span class="string">" closest num : "</span>&lt;&lt;<span class="built_in">array</span>[pos]&lt;&lt;endl;</span><br><span class="line">    &#125; <span class="keyword">while</span> (<span class="number">1</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>最简单的二分查找以及变形.</p>]]>
+    
+    </summary>
+    
+      <category term="二分查找" scheme="http://getwe.cn/tags/%E4%BA%8C%E5%88%86%E6%9F%A5%E6%89%BE/"/>
+    
+      <category term="算法" scheme="http://getwe.cn/tags/%E7%AE%97%E6%B3%95/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="基础算法" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[基础算法目录]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/algorithm/basic-algorithm-preface/"/>
+    <id>http://getwe.cn/技术/基础算法/algorithm/basic-algorithm-preface/</id>
+    <published>2014-08-26T01:35:18.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>虽然工作这几年做产品做业务的比重很大,但是还是觉得那些最基础的教科书上的算法不能丢,平时有机会需要用到的情况下,会顺手把教科书上的算法简单实现,在需要用到的时候也经常是拿来简单一改即可使用.</p>
+<p>这些代码小片段丢在磁盘上,万一磁盘坏了也算是一个杯具,这下可以借此机会存储到云端,存储有保障也可以在有需要时随时查阅,没有多少技术难度都是一些基础.</p>
+<a id="more"></a>
+<h1 id="查找算法">查找算法</h1><h2 id="二分查找"><a href="/技术/基础算法/algorithm/binarySearch/">二分查找</a></h2><h1 id="排序算法">排序算法</h1><h2 id="经典排序:冒泡,选择,插入"><a href="/技术/基础算法/algorithm/classic-sort/">经典排序:冒泡,选择,插入</a></h2><h2 id="快速排序"><a href="/技术/基础算法/algorithm/quickSort/">快速排序</a></h2><h1 id="公共头文件">公共头文件</h1><p>实现算法过程中,c++版本用到的一个方便调试的头文件<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br><span class="line">92</span><br><span class="line">93</span><br></pre></td><td class="code"><pre><span class="line"><span class="preprocessor">#ifndef INTERFACE</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">define</span> INTERFACE</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;iostream&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;math.h&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;algorithm&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;string.h&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;assert.h&gt;</span></span><br><span class="line"></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;stdio.h&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;stdlib.h&gt;</span></span><br><span class="line"></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;stack&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;vector&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;queue&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;map&gt;</span></span><br><span class="line"></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;bitset&gt;</span></span><br><span class="line"><span class="preprocessor">#<span class="keyword">include</span>&lt;iterator&gt;</span></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="keyword">typedef</span> <span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="keyword">int</span>&gt; &gt; IntArrayArray;</span><br><span class="line"><span class="keyword">typedef</span> <span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="keyword">char</span>&gt; &gt; CharArrayArray;</span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">resize</span><span class="params">(<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;T&gt; &gt; &amp; c,</span><br><span class="line">        <span class="keyword">int</span> len1,<span class="keyword">int</span> len2,T defvalue = T()</span>)</span><br><span class="line"></span>&#123;</span><br><span class="line">    c.resize(len1);</span><br><span class="line">    <span class="keyword">for</span>(<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; len1;i++)&#123;</span><br><span class="line">        c[i].resize(len2,defvalue);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line">    </span><br><span class="line"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">array_dump</span><span class="params">(<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;T&gt; &amp; cc)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    copy(cc.begin(),cc.end(),ostream_iterator&lt;T&gt;(<span class="built_in">std</span>::<span class="built_in">cout</span>,<span class="string">" "</span>));</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;endl;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">array_dump</span><span class="params">(T * begin,T * end)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">while</span> (begin != end)&#123;</span><br><span class="line">        <span class="built_in">cout</span>&lt;&lt;*begin&lt;&lt;<span class="string">" "</span>;</span><br><span class="line">        ++begin;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="built_in">cout</span>&lt;&lt;endl;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">ArrayArray_dump</span><span class="params">(<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;<span class="built_in">std</span>::<span class="built_in">vector</span>&lt;T&gt; &gt; &amp; c)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">using</span> <span class="keyword">namespace</span> <span class="built_in">std</span>;</span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i=<span class="number">0</span>; i&lt;c.size();++i)&#123;</span><br><span class="line">        <span class="keyword">for</span> (<span class="keyword">int</span> j = <span class="number">0</span>; j &lt; c[i].size(); ++j)&#123;</span><br><span class="line">            <span class="built_in">cout</span>&lt;&lt;c[i][j]&lt;&lt;<span class="string">" "</span>;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="built_in">cout</span>&lt;&lt;endl;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">myRand</span><span class="params">(T * <span class="built_in">array</span>,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    time_t t;</span><br><span class="line">    time(&amp;t);</span><br><span class="line">    srandom(t);</span><br><span class="line">    <span class="keyword">for</span>(<span class="keyword">int</span> i=<span class="number">0</span>;i&lt;arrayLen;i++)&#123;</span><br><span class="line">        <span class="built_in">array</span>[i] = random() % <span class="number">1000</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">myRand</span><span class="params">(T ** pArray,<span class="keyword">unsigned</span> <span class="keyword">int</span> arrayLen)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    *pArray = <span class="keyword">new</span> T[arrayLen];</span><br><span class="line">    myRand(*pArray,arrayLen);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt;</span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">myRand</span><span class="params">(T ** pArray,<span class="keyword">char</span> * strarrayLen)</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    <span class="keyword">unsigned</span> <span class="keyword">int</span> len = atoi(strarrayLen);</span><br><span class="line">    *pArray = <span class="keyword">new</span> T[len];</span><br><span class="line">    myRand(pArray,len);</span><br><span class="line">&#125;</span><br><span class="line"><span class="preprocessor">#<span class="keyword">endif</span></span></span><br></pre></td></tr></table></figure></p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>虽然工作这几年做产品做业务的比重很大,但是还是觉得那些最基础的教科书上的算法不能丢,平时有机会需要用到的情况下,会顺手把教科书上的算法简单实现,在需要用到的时候也经常是拿来简单一改即可使用.</p>
+<p>这些代码小片段丢在磁盘上,万一磁盘坏了也算是一个杯具,这下可以借此机会存储到云端,存储有保障也可以在有需要时随时查阅,没有多少技术难度都是一些基础.</p>]]>
+    
+    </summary>
+    
+      <category term="算法" scheme="http://getwe.cn/tags/%E7%AE%97%E6%B3%95/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="基础算法" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E5%9F%BA%E7%A1%80%E7%AE%97%E6%B3%95/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-ID管理器]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-idmanager/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-idmanager/</id>
+    <published>2014-08-24T12:39:20.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>IdManager在整个索引库中负责管理内外部文档id.</p>
+<a id="more"></a>
+<h2 id="一、设计思想">一、设计思想</h2><p>一般的检索系统,为了方便内部管理,会为外部文档分配一个内部id,存在于检索内部,每一个doc都会有一个唯一id.<br>相对应的,外部输入的每一篇文档会对应有一个外部id,这依赖整个系统其它子系统对id的管理.</p>
+<p>存在着内部id与外部id的互相映射关系,但是在goose的实现中,只实现了内部id查找外部id的功能,不支持在检索中使用id查找内部id,因为goose所需要实现的功能暂时不需要.</p>
+<p>为了实现内部id快速查找外部id,需要可安全并发查询的key/value算法.另外Id关系数据要有比较高(相对于纯内存数据)的安全性,可支持并发读写.</p>
+<h2 id="二、实现方法">二、实现方法</h2><p>直接使用磁盘文件实现key/value算法.内部id在goose中顺序分配,是一个int32类型.goose设计解决百万级别的doc数,要求外部id也是一个int32类型.<br>将内部id作为文件偏移量信息,对应的数据作为外部id.</p>
+<p>假设最多有1千万个文档id,每个id使用4个字节存储,只需要1000*10000*4/1024/1024 = 38MB的文件便可以存储映射信息,另外由于文件体积较小,直接使用mmap方式打开,方便读写以及同步到磁盘.</p>
+<h2 id="三、分配id">三、分配id</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (this *IdManager) AllocID(outId OutIdType) (InIdType,error)</span><br></pre></td></tr></table></figure>
+<p>分配id不可并发,内部进行加锁以保证安全.</p>
+<p>内部id顺序分配,根据下一个可分配的内部id乘于4得到文件偏移量,在文件中写入外部id.</p>
+<h2 id="四、查找id">四、查找id</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (this *IdManager) GetOutID(inId InIdType)(OutIdType,error)</span><br></pre></td></tr></table></figure>
+<p>每一个外部id占用4个字节,使用内部id乘于4得到文件偏移量,直接读取得到外部id.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>IdManager在整个索引库中负责管理内外部文档id.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-内存索引MemoryIndex]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-memoryindex/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-memoryindex/</id>
+    <published>2014-08-24T12:06:31.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>MemoryIndex模块用于管理内存倒排索引,类似于DiskIndex,但是简单很多.</p>
+<a id="more"></a>
+<h2 id="一、设计思想">一、设计思想</h2><p>MemoryIndex在实现的时候有这样的一些规则：</p>
+<ul>
+<li>纯内存,所持有的内存如果不能及时保存到磁盘,一旦程序崩溃,全部数据丢失.</li>
+<li>读操作并发下安全,以保证并发检索不会互相干扰.</li>
+<li>写操作不支持并发,而且写操作会加写锁,暂停读取.</li>
+</ul>
+<h2 id="二、索引设计">二、索引设计</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">map</span>[TermSign] *InvList</span><br></pre></td></tr></table></figure>
+<p>非常简单粗暴,使用golang自带的map类型存储倒排拉链.</p>
+<h2 id="三、写入索引">三、写入索引</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*MemoryIndex) WriteIndex(t TermSign,l *InvList) (error)</span><br></pre></td></tr></table></figure>
+<p>写入索引,内部加写锁进行写入.<br>同一个term多次写入,会进行append操作.</p>
+<h2 id="四、读取索引">四、读取索引</h2><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*MemoryIndex) ReadIndex(t TermSign)(*InvList,error)</span><br></pre></td></tr></table></figure>
+<p>读取索引时先加读锁,然后读取拉链返回.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>MemoryIndex模块用于管理内存倒排索引,类似于DiskIndex,但是简单很多.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-磁盘索引DiskIndex]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/database-diskindex/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/database-diskindex/</id>
+    <published>2014-08-23T06:51:31.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>DiskIndex模块用于管理磁盘倒排索引,是整个dabatase的最重要的一个类.</p>
+<a id="more"></a>
+<h2 id="一、设计思想">一、设计思想</h2><p>DiskIndex在实现的时候遵循了以下思想:</p>
+<ul>
+<li>带状态模式,要不<strong>只读</strong>,要不<strong>只写</strong>.</li>
+<li>读操作并发下安全,因此可以高效读取索引.</li>
+<li>写操作不支持并发,内部通过加锁保证安全.</li>
+<li>索引数据全部磁盘化,持久性存储由磁盘保证.</li>
+</ul>
+<h2 id="二、带状态的磁盘索引">二、带状态的磁盘索引</h2><p>调用<code>NewDiskIndex()</code>构造函数生成一个*DiskIndex,内部状态为<code>DiskIndexInit</code>.<br>如果构造函数后继续调用<code>Open</code>打开磁盘上已经存在的索引,则进入<code>DiskIndexReadOnly</code>索引只读状态,后续只能读取索引,不能写入.<br>如果构造函数后继续调用<code>Init</code>在磁盘指定位置创建全新的索引,则进入<code>DiskIndexWriteOnly</code>索引只写状态,后续只能写入索引,无法读取.<br>只读或者只写状态下调用<code>Close</code>后进入<code>DiskIndexClose</code>,此时所有资源已经清空释放,不能进行任何操作.</p>
+<h2 id="三、索引设计">三、索引设计</h2><p>磁盘索引采用三层索引.</p>
+<h3 id="三级索引">三级索引</h3><p>三级索引是变长数据,按块写入,每一块数据就是完整的一条倒排拉链的数据.倒排拉链数据通过序列化后形成一整块二进制数据,然后整块写入.序列化的协议采用的是标准库<code>encoding/gob</code>协议.因此三级索引在磁盘上的格式就是:<br>| 第一个二进制数据块 | 第二块二进制数据块 | … … | 第N块二进制数据块</p>
+<p>每一块数据所需要的索引信息就是在文件中的起始信息Offset以及数据长度Length,因此简单情况下在写入的时候记下<code>Offset,Length</code>,就可以在读取的时候正确读到数据.</p>
+<p>在实际存储,三级索引可能是一个非常大的文件,文件大小可能会受到操作系统的限制,因此我采用了使用多个物理文件来组成逻辑上一个大文件,因此开发了<code>goose/utils/bigfile.go</code>来支持这个需求.通过这个改进以后,对于DiskIndex来说,写入三级索引需要记录的偏移信息就是<code>FileNo,Offset,Length</code>.</p>
+<h3 id="二级索引">二级索引</h3><p>二级索引是定长数据,负责存储<code>FileNo,Offset,Length</code>信息.直接采用一个系统文件进行读写,在golang中就是使用<code>*os.File</code>进行操作.二级索引每次读取或者写入9个字节,其中FileNo占用1个字节,Offset和Length分别各占用4个字节.</p>
+<h3 id="一级索引">一级索引</h3><p>一级索引是定长数据,顺序存储所有Term信息.采用mmap进行存储.</p>
+<h3 id="零级索引">零级索引</h3><p>零级索引是定长数据,常驻于内存,在只读索引中用到,用于快速定位一级索引,减少磁盘(mmap还是读磁盘)读取.</p>
+<p><img src="/static/img/goose-diskindex.png" alt="磁盘索引结构"></p>
+<h2 id="四、写入索引">四、写入索引</h2><p>为了安全,写索引全程加互斥锁,保证不能并发写入.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DiskIndex) WriteIndex(t TermSign,l *InvList) (error)</span><br></pre></td></tr></table></figure>
+<p>由于可写的磁盘索引只能进行写入操作,因此所有写入的索引都是以此在磁盘中顺序存储.<br>另外,为了支持以后的索引读取,DiskIndex<strong><em>要求所有顺序写入的TermSign是升序有序</em></strong></p>
+<h3 id="写入三级索引">写入三级索引</h3><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DiskIndex) writeIndex3(t TermSign, l *InvList) (error)</span><br></pre></td></tr></table></figure>
+<p>首先,利用<code>encoding/gob</code>协议把倒排拉链<code>*InvList</code>序列化为二进制块.</p>
+<p>将序列化好的二进制块写入逻辑大文件中.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*BigFile) Append(buf []<span class="typename">byte</span>)(*BigFileIndex,error)</span><br></pre></td></tr></table></figure>
+<p>返回的<code>BigFileIndex</code>就<code>FileNo,Offset,Length</code>.</p>
+<h3 id="写入二级索引">写入二级索引</h3><p>把BigFileIndex压缩成一个9个字节的[]byte,根据已经写入的term数量算出接下来需要写入二级索引的文件偏移量,然后把二级索引信息写入.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (f *File) WriteAt(b []<span class="typename">byte</span>, off <span class="typename">int64</span>) (n <span class="typename">int</span>, err error)</span><br></pre></td></tr></table></figure>
+<h3 id="写入一级索引">写入一级索引</h3><p>最后写入TermSign信息,根据已经写入的term数量算出当前term在一级索引文件中需要保存的位置,然后直接保存.</p>
+<h2 id="五、读取索引">五、读取索引</h2><p>对效率的高要求,索引读取支持并发读取,内部不会有任何锁操作.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DiskIndex) ReadIndex(t TermSign)(*InvList,error)</span><br></pre></td></tr></table></figure>
+<h3 id="读取零级索引">读取零级索引</h3><p>零级索引只存在于内存,在打开已有的磁盘的索引的时候根据一级索引实时生成.把一级索引按照定长分隔成块,每一块取第一个term组成零级索引.</p>
+<p>读取索引的时候首先读取内存上的零级索引,确定所查找的term在一级索引中属于哪一块.</p>
+<p>因写入的时候假设外部都是有序写入倒排拉链,因此零级索引是有序的,查找的时候进行一次二分查找,效率上可以得到保证.</p>
+<figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">func</span> (*DiskIndex) readIndex0(t TermSign) (<span class="typename">int</span>)</span><br></pre></td></tr></table></figure>
+<h3 id="读取一级索引">读取一级索引</h3><p>零级索引确定了term在一级索引中属于哪一块,接下来再在块中进行一次二分查找,最终确定term在一级索引中的位置.</p>
+<h3 id="读取二级索引">读取二级索引</h3><p>确定了term在一级索引中的位置,便可直接读取二级索引信息,得到<code>FileNo,Offset,Length</code>.</p>
+<h3 id="读取三级索引">读取三级索引</h3><p>最后,根据<code>FileNo,Offset,Length</code>读取三级索引,得到一块二进制块数据,对数据根据<code>encoding/gob</code>协议进行反序列化,最终得到倒排拉链.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>DiskIndex模块用于管理磁盘倒排索引,是整个dabatase的最重要的一个类.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-目录]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/catalog/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/catalog/</id>
+    <published>2014-08-22T02:33:37.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<h1 id="目录">目录</h1><h2 id="序言0"><a href="/技术/搜索引擎/goose/preface0/">序言0</a></h2><h2 id="序言1"><a href="/技术/搜索引擎/goose/preface1/">序言1</a></h2><a id="more"></a>
+<h2 id="第一部分_goose的内部设计">第一部分 goose的内部设计</h2><h3 id="database模块">database模块</h3><h4 id="磁盘索引DiskIndex"><a href="/技术/搜索引擎/goose/database-diskindex/">磁盘索引DiskIndex</a></h4><h4 id="内存索引MemoryIndex"><a href="/技术/搜索引擎/goose/database-memoryindex/">内存索引MemoryIndex</a></h4><h4 id="ID管理器"><a href="/技术/搜索引擎/goose/database-idmanager/">ID管理器</a></h4><h4 id="Value管理器"><a href="/技术/搜索引擎/goose/database-valuemanager/">Value管理器</a></h4><h4 id="Data管理器"><a href="/技术/搜索引擎/goose/database-datamanager/">Data管理器</a></h4><h4 id="静态索引StaticIndex"><a href="/技术/搜索引擎/goose/database-staticindex/">静态索引StaticIndex</a></h4><h4 id="动态索引VarIndex"><a href="/技术/搜索引擎/goose/database-varindex/">动态索引VarIndex</a></h4><h2 id="第二部分_goose的二次开发">第二部分 goose的二次开发</h2><h2 id="第三部分_通用搜索引擎cse">第三部分 通用搜索引擎cse</h2>]]></content>
+    <summary type="html">
+    <![CDATA[<h1 id="目录">目录</h1><h2 id="序言0"><a href="/技术/搜索引擎/goose/preface0/">序言0</a></h2><h2 id="序言1"><a href="/技术/搜索引擎/goose/preface1/">序言1</a></h2>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-序言1]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/preface1/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/preface1/</id>
+    <published>2014-08-22T02:32:38.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<h1 id="什么是goose">什么是goose</h1><p>goose是使用golang开发检索框架,目标是打造一个简单方便使用的小型检索系统.<br>期望解决百万量级doc数量的检索问题.</p>
+<a id="more"></a>
+<h1 id="为什么叫goose">为什么叫goose</h1><p>由于是使用golang开发的search engine,一开始想到就是用gose这个单词,但是其没有什么含义,突然发现往中间加多一个字母o,就形成了一个有意义的单词 <strong><em>goose</em></strong> ,另外想到很多牛X的项目(或语言)都以动物名字来命名,所以觉得 <strong><em>goose</em></strong> 这个名字挺好.</p>
+<h1 id="goose的特性(设计原则)">goose的特性(设计原则)</h1><p>在开发goose的之前,设想了需要解决的问题以及最后的形态,goose有着以下的特性,在设计其子模块的时候也都是以以下原则为前提.</p>
+<h2 id="百万量级">百万量级</h2><p>目标解决问题是百万量级的文档的检索问题.百万量级做全网网页检索肯定是不够的,全网网页检索需要一套非常庞大的检索系统,但是在实际的工程中,有很多时候我们不需要这么复杂,而是需要一个轻便的,可以快速搭建的检索服务,因此百万量级能够满足很多普通的工程需求.</p>
+<h2 id="只是一个搜索框架">只是一个搜索框架</h2><p>一个搜索系统可能会包含爬虫,离线数据处理,数据存储,检索模块等功能模块.检索模块在设计上又可以分为检索框架以及检索策略.而goose只是其中的检索框架,也就是说仅仅只有goose还不能成为一个完成的服务,他还需要相应的检索策略实现.<br>通常情况下,框架是比较容易复用的,而策略相对不容易复用,因为策略需要根据实际的产品需求决定,而且还有可能混杂着产品业务逻辑,因此使用goose需要基于goose做二次开发,实现相应的检索策略,才能形成完整的服务.</p>
+<p>有时候会需要快速搭建一个检索服务,检索策略不需要过多的定制,采用通用的策略即可.而且根本就不想进行编码工作,最好是拿到就可以使用.针对这样的场景,我基于goose进行了二次开发,实现了一套通用检索策略,取名为<a href="https://github.com/getwe/cse" target="_blank" rel="external">cse</a>意思是Common Search Engine,可以实现零编码,纯配置的通用搜索引擎.</p>
+<h2 id="单机单进程">单机单进程</h2><p>goose是一个单机单进程服务,启动一个进程的情况下可以完成检索系统所需的功能,<strong>索引建库</strong>,<strong>实时索引更新</strong>以及<strong>检索</strong>均在一个服务中完成.<br>由于目标是百万量级的文档数的检索问题,即使是现在的一台普通PC的硬件配置都可以解决问题,因此完全不考虑实现成一个分布式的检索系统.单机服务使得整个系统更简单,更容易开发以及维护升级.<br>关于单机服务系统的性能,稳定性以及容灾性问题,在实际工作中,我曾经是这样解决的:</p>
+<ul>
+<li>多机房多机器重复部署</li>
+<li>实时索引同时更新到全部机器</li>
+<li>需要全量切换索引的时候同时切换</li>
+<li>上游请求检索服务的时候做负载均衡</li>
+</ul>
+<h2 id="实时索引">实时索引</h2><p>goose设计为支持实时索引,在提供检索服务的时候,可以实时往其写入文档,并在<strong>短时间</strong>内被检索出来.</p>
+<h2 id="socket网络服务">socket网络服务</h2><p>goose设计对外提供的索引更新和检索服务均为socket服务,这样跟其它服务耦合比较低.另外goose跟其它服务通信的协议完全由策略决定,采用json,messagepack或者protocolbuf等任何一种协议对goose来说都无差别,都是一段二进制字节数据.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<h1 id="什么是goose">什么是goose</h1><p>goose是使用golang开发检索框架,目标是打造一个简单方便使用的小型检索系统.<br>期望解决百万量级doc数量的检索问题.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[goose自己写的搜索引擎-序言0]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/goose/preface0/"/>
+    <id>http://getwe.cn/技术/搜索引擎/goose/preface0/</id>
+    <published>2014-08-22T02:29:44.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<h1 id="为什么自己写一个搜索引擎">为什么自己写一个搜索引擎</h1><p>在百度的几年时间里面,做的产品都是垂直类搜索产品,在垂搜这个方向积累了很多产品和技术上的经验.接触过百度内部的很多个搜索引擎,内心一直有一个小情结,想自己实现一个搜索引擎.</p>
+<p>现在虽然还在我度上班,但是我认为自己以后肯定会寻找机会,自己出来创业的,对于技术深度以及技术广度上面,我认为在某个领域上有一定的深度就够了,还应该发展一下技术广度,朝着所谓的<strong>全栈工程师</strong>发展.因此,自己独立实现一套检索系统是符合这个指导思想的.</p>
+<p>2013年下半年,由于工作上一些不方便说的原因,个人时间比较多,偶尔闲的蛋疼,于是乎开始各种技术调研,开始做了起来.</p>
+<a id="more"></a>
+<h1 id="技术选型">技术选型</h1><p>最初采用C++进行开发,这是我最熟悉的语言,也是工作上的第一开发语言,但是最后goose是用golang完成开发的.</p>
+<h2 id="开发效率">开发效率</h2><p>相比脚本语言,C/C++的开发效率一直是一个槽点,我也渴望有一门语言,在开发效率和运行效率上能够做一定的折中,直到后来遇到golang.</p>
+<h2 id="第三方库">第三方库</h2><p>在整个开发过程中,有一些功能网上肯定有开源的实现,避免重复造轮子的情况下,能直接使用的应该直接使用.像C/C++这种缺乏包管理系统的语言,在引用管理第三库上面的确有点痛苦,而golang在这方面做的还算不错.</p>
+<h2 id="全栈工程师的需要">全栈工程师的需要</h2><p>最后一个原因,技术体系的选择以及成长,等自己出来创业的一天,需要更注重开发效率的情况下,应该不会选择C++作为主要开发语言,golang根据之前的了解,是一个不错的选择,正好借着这个机会好好学习和应用这门语言.</p>
+<h1 id="不好的地方">不好的地方</h1><p>没有从一开始就做好记录工作,开始写这些文章都已经是完成了整个搜索引擎的第一版开发,现在是通过回忆来做记录.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<h1 id="为什么自己写一个搜索引擎">为什么自己写一个搜索引擎</h1><p>在百度的几年时间里面,做的产品都是垂直类搜索产品,在垂搜这个方向积累了很多产品和技术上的经验.接触过百度内部的很多个搜索引擎,内心一直有一个小情结,想自己实现一个搜索引擎.</p>
+<p>现在虽然还在我度上班,但是我认为自己以后肯定会寻找机会,自己出来创业的,对于技术深度以及技术广度上面,我认为在某个领域上有一定的深度就够了,还应该发展一下技术广度,朝着所谓的<strong>全栈工程师</strong>发展.因此,自己独立实现一套检索系统是符合这个指导思想的.</p>
+<p>2013年下半年,由于工作上一些不方便说的原因,个人时间比较多,偶尔闲的蛋疼,于是乎开始各种技术调研,开始做了起来.</p>]]>
+    
+    </summary>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="goose" scheme="http://getwe.cn/tags/goose/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="搜索引擎" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[cgoNotes]]></title>
+    <link href="http://getwe.cn/%E6%8A%80%E6%9C%AF/golang/cgoNotes/"/>
+    <id>http://getwe.cn/技术/golang/cgoNotes/</id>
+    <published>2014-08-22T01:40:31.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>一些关于cgo的零散笔记.</p>
+<a id="more"></a>
+<h1 id="cgo编译">cgo编译</h1><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/*</span><br><span class="line">#cgo CFLAGS: -DDEBUG</span><br><span class="line">#cgo LDFLAGS: -lpthead</span><br><span class="line">#cgo pkg-config: libxml-2.0</span><br><span class="line">#include &lt;stdio.h&gt;</span><br><span class="line">struct persion&#123;</span><br><span class="line">&#125;;</span><br><span class="line">*/</span></span><br></pre></td></tr></table></figure>
+<p>备注:</p>
+<ol>
+<li>import “C” 前的注释相当于插入一个c头文件</li>
+<li>#cgo 相当于设置cgo的环境变量</li>
+<li><code>CGO_CFLAGS</code>和<code>CGO_LDFLAGS</code>加入编译链接选项,一般只定义一些通用的选项</li>
+<li>CGO也支持pkg-config语法</li>
+</ol>
+<h1 id="关键字冲突">关键字冲突</h1><p>在go文件中,C标识符或者成员变量如果在go中是关键字,会导致命名冲突.<br>可以通过添加前缀”_”获取,假设c struct如果有成员变量名字为type,在go使用该变量会导致冲突<br>必须这样使用xxx_struct_object._type</p>
+<h1 id="c的字符串跟go的string转换">c的字符串跟go的string转换</h1><p>通过复制的方式实现的一些转换函数<br><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Go string to C string</span></span><br><span class="line"><span class="comment">// C.free() 需要调用保证生成的c字符串释放内存</span></span><br><span class="line"><span class="keyword">func</span> C.CString(<span class="typename">string</span>) *C.char</span><br><span class="line"> </span><br><span class="line"><span class="comment">// C string to Go string</span></span><br><span class="line"><span class="keyword">func</span> C.GoString(*C.char) <span class="typename">string</span></span><br><span class="line">  </span><br><span class="line"><span class="comment">// C string,leng to Go string</span></span><br><span class="line"><span class="keyword">func</span> C.GoStringN(*C.char,C.<span class="typename">int</span>) <span class="typename">string</span></span><br><span class="line">   </span><br><span class="line"><span class="comment">// C pointer,length to Go []byte</span></span><br><span class="line"><span class="keyword">func</span> C.GoBytes(unsafe.Pointer,C.<span class="typename">int</span>) []<span class="typename">byte</span></span><br></pre></td></tr></table></figure></p>
+<h1 id="调用c函数传递一块内存">调用c函数传递一块内存</h1><p>c函数需要的func(char * buf,int len)这样一块内存进行操作,go传递的方法<br><figure class="highlight go"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">buf := <span class="built_in">make</span>([]<span class="typename">byte</span>,<span class="number">10240</span>)</span><br><span class="line">C.<span class="keyword">func</span>( (*C.char)(unsafe.Pointer(&amp;buf[<span class="number">0</span>])) , C.<span class="typename">int</span>(<span class="built_in">len</span>(buf)) )</span><br></pre></td></tr></table></figure></p>
+<h1 id="标准C数值类型在go中的类型">标准C数值类型在go中的类型</h1><table>
+<thead>
+<tr>
+<th><em>go</em></th>
+<th><em>c</em></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C.char</td>
+<td>char</td>
+</tr>
+<tr>
+<td>C.schar</td>
+<td>signed char</td>
+</tr>
+<tr>
+<td>C.uchar</td>
+<td>unsigned char</td>
+</tr>
+<tr>
+<td>C.short</td>
+<td>short</td>
+</tr>
+<tr>
+<td>C.ushort</td>
+<td>unsigned short</td>
+</tr>
+<tr>
+<td>C.int</td>
+<td>int</td>
+</tr>
+<tr>
+<td>C.uint</td>
+<td>unsigned int</td>
+</tr>
+<tr>
+<td>C.long</td>
+<td>long</td>
+</tr>
+<tr>
+<td>C.ulong</td>
+<td>unsigned long</td>
+</tr>
+<tr>
+<td>C.longlong</td>
+<td>long long</td>
+</tr>
+<tr>
+<td>C.ulonglong</td>
+<td>unsigned long long</td>
+</tr>
+<tr>
+<td>C.float</td>
+<td>float</td>
+</tr>
+<tr>
+<td>C.double</td>
+<td>double</td>
+</tr>
+<tr>
+<td>void*</td>
+<td>unsafe.Pointer</td>
+</tr>
+</tbody>
+</table>
+<h1 id="cgo在命令行传递选项给c编译器">cgo在命令行传递选项给c编译器</h1><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">go tool cgo [compiler options] file.go</span><br></pre></td></tr></table></figure>
+<p>[compiler options]传递给gcc,作为编译c代码的编译选项</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>一些关于cgo的零散笔记.</p>]]>
+    
+    </summary>
+    
+      <category term="cgo" scheme="http://getwe.cn/tags/cgo/"/>
+    
+      <category term="golang" scheme="http://getwe.cn/tags/golang/"/>
+    
+      <category term="技术" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/"/>
+    
+      <category term="golang" scheme="http://getwe.cn/categories/%E6%8A%80%E6%9C%AF/golang/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[第一篇]]></title>
+    <link href="http://getwe.cn/%E4%B8%AA%E4%BA%BA/%E5%B7%A5%E4%BD%9C/firstBlog/"/>
+    <id>http://getwe.cn/个人/工作/firstBlog/</id>
+    <published>2014-08-21T09:43:37.000Z</published>
+    <updated>2015-04-20T06:47:48.000Z</updated>
+    <content type="html"><![CDATA[<p>今天是周四,正常的上班工作时间,为什么我会用一个下午的时间来折腾这些…</p>
+<p>最近真是受够了麦库记事,觉得用起来很是不爽,希望找一个地方来整理存储一些技术笔记<br>(不要鄙视我,转载远多于原创,毕竟很多东西网上一搜就有了).</p>
+<p>了解到github Pages服务的各种特点,基本符合我的要求,于是乎就这么折腾了一下.</p>
+]]></content>
+    <summary type="html">
+    <![CDATA[<p>今天是周四,正常的上班工作时间,为什么我会用一个下午的时间来折腾这些…</p>
+<p>最近真是受够了麦库记事,觉得用起来很是不爽,希望找一个地方来整理存储一些技术笔记<br>(不要鄙视我,转载远多于原创,毕竟很多东西网上一搜就有了).</p>
+<p>了解到github Pa]]>
+    </summary>
+    
+      <category term="无聊" scheme="http://getwe.cn/tags/%E6%97%A0%E8%81%8A/"/>
+    
+      <category term="个人" scheme="http://getwe.cn/categories/%E4%B8%AA%E4%BA%BA/"/>
+    
+      <category term="工作" scheme="http://getwe.cn/categories/%E4%B8%AA%E4%BA%BA/%E5%B7%A5%E4%BD%9C/"/>
+    
+  </entry>
+  
+</feed>
